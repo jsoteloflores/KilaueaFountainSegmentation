@@ -135,7 +135,7 @@ CONFIG: Dict = {
     "mount_drive": True,  # mount Google Drive when running in Colab
 
     # --- Mode ---
-    "mode": "train",  # train | resume_train | infer_all | evaluate
+    "mode": "train",  # train | resume_train | infer_all | evaluate | infer_frame_folder
 
     # --- Image sizes ---
     "input_size": 1536,
@@ -193,6 +193,16 @@ CONFIG: Dict = {
     # --- Misc ---
     "checkpoint_path": None,          # required for resume_train / infer_all / evaluate
     "max_samples": None,              # cap dataset size for quick debugging (None = all)
+
+    # --- Frame-folder inference (infer_frame_folder mode) ---
+    "frame_folder": None,             # input folder of frame images
+    "frame_folder_output_dir": None,  # output folder for predicted masks
+    "frame_folder_recursive": False,  # scan subfolders too
+    "frame_folder_extensions": [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"],
+    "write_frame_folder_masks": True,
+    "write_frame_folder_overlays": False,
+    "write_frame_folder_probabilities": False,
+    "threshold_override": None,       # None = use threshold stored in checkpoint
 }
 
 # Resolve device early so the rest of the script can use it.
@@ -233,6 +243,292 @@ def check_gpu() -> None:
 
 
 check_gpu()
+
+# %% [markdown]
+# ## 3b. Frame-folder path pickers (infer_frame_folder mode only)
+#
+# When `CONFIG['mode'] == 'infer_frame_folder'` run these cells to pick:
+# 1. a trained model checkpoint  2. the input frame folder  3. the output mask folder
+#
+# Skip this section entirely for `train | resume_train | infer_all | evaluate` modes.
+#
+# Each widget browser lets you navigate Drive/Colab filesystem with arrow keys.
+# You can also paste any path manually and click **Use pasted path**.
+
+# %%
+if CONFIG["mode"] == "infer_frame_folder":
+    def _ensure_ipywidgets() -> None:
+        try:
+            import ipywidgets  # noqa: F401
+        except ImportError:
+            _pip_install("ipywidgets")
+    _ensure_ipywidgets()
+
+# %% [markdown]
+# ### FileBrowser — select a checkpoint file (.pth / .pt / .ckpt)
+
+# %%
+if CONFIG["mode"] == "infer_frame_folder":
+    import ipywidgets as widgets
+    from IPython.display import display as _display
+
+    class FileBrowser:
+        """Notebook-native file browser that writes the selected path to CONFIG."""
+
+        def __init__(self, config_key: str, title: str,
+                     start_path: Optional[str] = None,
+                     extensions: Tuple[str, ...] = (".pth", ".pt", ".ckpt")):
+            self.config_key = config_key
+            self.extensions = tuple(e.lower() for e in extensions)
+            self._cwd = Path(start_path or "/content/drive/MyDrive").expanduser()
+            if not self._cwd.is_dir():
+                self._cwd = Path.home()
+
+            self._lbl_title = widgets.HTML(f"<b>{title}</b>")
+            self._lbl_cwd   = widgets.HTML(self._fmt_cwd())
+            self._list      = widgets.Select(options=[], rows=12, layout=widgets.Layout(width="100%"))
+            self._btn_up    = widgets.Button(description="⬆ Up",    button_style="",  layout=widgets.Layout(width="80px"))
+            self._btn_open  = widgets.Button(description="Open",   button_style="info", layout=widgets.Layout(width="80px"))
+            self._btn_sel   = widgets.Button(description="Select file", button_style="success", layout=widgets.Layout(width="120px"))
+            self._txt_paste = widgets.Text(placeholder="Paste path here…", layout=widgets.Layout(width="100%"))
+            self._btn_paste = widgets.Button(description="Use pasted path", button_style="warning", layout=widgets.Layout(width="140px"))
+            self._status    = widgets.HTML("")
+
+            self._btn_up.on_click(self._on_up)
+            self._btn_open.on_click(self._on_open)
+            self._btn_sel.on_click(self._on_select)
+            self._btn_paste.on_click(self._on_paste)
+
+            self._refresh()
+
+        def _fmt_cwd(self) -> str:
+            return f"<code style='font-size:0.85em'>{self._cwd}</code>"
+
+        def _refresh(self) -> None:
+            try:
+                entries = sorted(self._cwd.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            except PermissionError:
+                entries = []
+            opts = []
+            for p in entries:
+                if p.name.startswith("."):
+                    continue
+                if p.is_dir():
+                    opts.append(f"📁 {p.name}")
+                elif p.suffix.lower() in self.extensions:
+                    opts.append(f"📄 {p.name}")
+            self._list.options = opts
+            self._lbl_cwd.value = self._fmt_cwd()
+
+        def _selected_path(self) -> Optional[Path]:
+            sel = self._list.value
+            if sel is None:
+                return None
+            name = sel[2:].strip()  # strip emoji prefix
+            return self._cwd / name
+
+        def _on_up(self, _b) -> None:
+            self._cwd = self._cwd.parent
+            self._refresh()
+
+        def _on_open(self, _b) -> None:
+            p = self._selected_path()
+            if p and p.is_dir():
+                self._cwd = p
+                self._refresh()
+
+        def _on_select(self, _b) -> None:
+            p = self._selected_path()
+            if p and p.is_file() and p.suffix.lower() in self.extensions:
+                CONFIG[self.config_key] = str(p)
+                self._status.value = (
+                    f"<span style='color:green'>✔ CONFIG['{self.config_key}'] = {p}</span>"
+                )
+            else:
+                self._status.value = "<span style='color:red'>Select a supported file first.</span>"
+
+        def _on_paste(self, _b) -> None:
+            raw = self._txt_paste.value.strip()
+            if not raw:
+                return
+            p = Path(raw)
+            if p.is_file() and p.suffix.lower() in self.extensions:
+                CONFIG[self.config_key] = str(p)
+                self._status.value = (
+                    f"<span style='color:green'>✔ CONFIG['{self.config_key}'] = {p}</span>"
+                )
+            else:
+                self._status.value = (
+                    f"<span style='color:red'>Path not found or wrong extension: {raw}</span>"
+                )
+
+        def display(self) -> None:
+            btn_row = widgets.HBox([self._btn_up, self._btn_open, self._btn_sel])
+            paste_row = widgets.HBox([self._txt_paste, self._btn_paste])
+            box = widgets.VBox([
+                self._lbl_title, self._lbl_cwd, self._list,
+                btn_row, paste_row, self._status,
+            ])
+            _display(box)
+
+    _fb = FileBrowser(
+        config_key="checkpoint_path",
+        title="1) Select model checkpoint (best_model.pth)",
+        start_path=CONFIG.get("run_root") or "/content/drive/MyDrive",
+    )
+    _fb.display()
+
+# %% [markdown]
+# ### FolderBrowser — select input frame folder and output mask folder
+
+# %%
+if CONFIG["mode"] == "infer_frame_folder":
+
+    class FolderBrowser:
+        """Notebook-native folder browser that writes the selected path to CONFIG."""
+
+        def __init__(self, config_key: str, title: str,
+                     start_path: Optional[str] = None,
+                     allow_create: bool = False):
+            self.config_key = config_key
+            self.allow_create = allow_create
+            self._cwd = Path(start_path or "/content/drive/MyDrive").expanduser()
+            if not self._cwd.is_dir():
+                self._cwd = Path.home()
+
+            self._lbl_title = widgets.HTML(f"<b>{title}</b>")
+            self._lbl_cwd   = widgets.HTML(self._fmt_cwd())
+            self._list      = widgets.Select(options=[], rows=10, layout=widgets.Layout(width="100%"))
+            self._btn_up    = widgets.Button(description="⬆ Up",  button_style="",      layout=widgets.Layout(width="80px"))
+            self._btn_open  = widgets.Button(description="Open",  button_style="info",  layout=widgets.Layout(width="80px"))
+            self._btn_sel   = widgets.Button(description="Select this folder", button_style="success", layout=widgets.Layout(width="160px"))
+            self._txt_paste = widgets.Text(placeholder="Paste folder path here…", layout=widgets.Layout(width="100%"))
+            self._btn_paste = widgets.Button(description="Use pasted path", button_style="warning", layout=widgets.Layout(width="140px"))
+            self._status    = widgets.HTML("")
+
+            self._btn_up.on_click(self._on_up)
+            self._btn_open.on_click(self._on_open)
+            self._btn_sel.on_click(self._on_select_current)
+            self._btn_paste.on_click(self._on_paste)
+
+            self._refresh()
+
+        def _fmt_cwd(self) -> str:
+            return f"<code style='font-size:0.85em'>{self._cwd}</code>"
+
+        def _refresh(self) -> None:
+            try:
+                entries = sorted(
+                    (p for p in self._cwd.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                    key=lambda p: p.name.lower(),
+                )
+            except PermissionError:
+                entries = []
+            self._list.options = [f"📁 {p.name}" for p in entries]
+            self._lbl_cwd.value = self._fmt_cwd()
+
+        def _selected_subdir(self) -> Optional[Path]:
+            sel = self._list.value
+            if sel is None:
+                return None
+            name = sel[2:].strip()
+            return self._cwd / name
+
+        def _on_up(self, _b) -> None:
+            self._cwd = self._cwd.parent
+            self._refresh()
+
+        def _on_open(self, _b) -> None:
+            p = self._selected_subdir()
+            if p and p.is_dir():
+                self._cwd = p
+                self._refresh()
+
+        def _on_select_current(self, _b) -> None:
+            CONFIG[self.config_key] = str(self._cwd)
+            self._status.value = (
+                f"<span style='color:green'>✔ CONFIG['{self.config_key}'] = {self._cwd}</span>"
+            )
+
+        def _on_paste(self, _b) -> None:
+            raw = self._txt_paste.value.strip()
+            if not raw:
+                return
+            p = Path(raw)
+            if p.is_dir():
+                CONFIG[self.config_key] = str(p)
+                self._status.value = (
+                    f"<span style='color:green'>✔ CONFIG['{self.config_key}'] = {p}</span>"
+                )
+            elif self.allow_create:
+                CONFIG[self.config_key] = str(p)
+                self._status.value = (
+                    f"<span style='color:orange'>⚠ Path does not exist yet; "
+                    f"will be created during inference. "
+                    f"CONFIG['{self.config_key}'] = {p}</span>"
+                )
+            else:
+                self._status.value = (
+                    f"<span style='color:red'>Folder not found: {raw}</span>"
+                )
+
+        def display(self) -> None:
+            btn_row = widgets.HBox([self._btn_up, self._btn_open, self._btn_sel])
+            paste_row = widgets.HBox([self._txt_paste, self._btn_paste])
+            box = widgets.VBox([
+                self._lbl_title, self._lbl_cwd, self._list,
+                btn_row, paste_row, self._status,
+            ])
+            _display(box)
+
+    _fb_frames = FolderBrowser(
+        config_key="frame_folder",
+        title="2) Select input frame folder",
+        start_path=CONFIG.get("dataset_root") or "/content/drive/MyDrive",
+    )
+    _fb_frames.display()
+
+    _fb_output = FolderBrowser(
+        config_key="frame_folder_output_dir",
+        title="3) Select output mask folder (will be created if it does not exist)",
+        start_path=CONFIG.get("run_root") or "/content/drive/MyDrive",
+        allow_create=True,
+    )
+    _fb_output.display()
+
+# %% [markdown]
+# ### Confirm selected paths (run after using the pickers above)
+
+# %%
+if CONFIG["mode"] == "infer_frame_folder":
+    def require_frame_folder_paths() -> None:
+        cp        = CONFIG.get("checkpoint_path")
+        frame_dir = CONFIG.get("frame_folder")
+        out_dir   = CONFIG.get("frame_folder_output_dir")
+
+        if not cp or not os.path.isfile(cp):
+            raise FileNotFoundError(
+                "checkpoint_path is not set or does not exist. "
+                "Use the FileBrowser above or set CONFIG['checkpoint_path'] directly."
+            )
+        if not frame_dir or not os.path.isdir(frame_dir):
+            raise FileNotFoundError(
+                "frame_folder is not set or does not exist. "
+                "Use the FolderBrowser above or set CONFIG['frame_folder'] directly."
+            )
+        if not out_dir:
+            raise ValueError(
+                "frame_folder_output_dir is not set. "
+                "Use the FolderBrowser above or set CONFIG['frame_folder_output_dir'] directly."
+            )
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        print("Paths confirmed:")
+        print(f"  Checkpoint   : {cp}")
+        print(f"  Frame folder : {frame_dir}")
+        print(f"  Output masks : {out_dir}")
+
+    require_frame_folder_paths()
 
 # %% [markdown]
 # ## 4. Dataset discovery and validation
@@ -419,13 +715,17 @@ def summarize_dataset(df: pd.DataFrame) -> None:
 
 
 DATASET_ROOT = Path(CONFIG["dataset_root"]).expanduser()
-frames_df = load_frames(DATASET_ROOT)
-frames_df = validate_dataset(frames_df, CONFIG)
-summarize_dataset(frames_df)
+if CONFIG["mode"] in ("train", "resume_train", "infer_all", "evaluate"):
+    frames_df = load_frames(DATASET_ROOT)
+    frames_df = validate_dataset(frames_df, CONFIG)
+    summarize_dataset(frames_df)
 
-if CONFIG["max_samples"] is not None:
-    frames_df = frames_df.head(int(CONFIG["max_samples"])).copy()
-    print(f"\n[debug] Capped dataset to {len(frames_df)} rows via CONFIG['max_samples'].")
+    if CONFIG["max_samples"] is not None:
+        frames_df = frames_df.head(int(CONFIG["max_samples"])).copy()
+        print(f"\n[debug] Capped dataset to {len(frames_df)} rows via CONFIG['max_samples'].")
+else:
+    frames_df = None
+    print(f"Mode '{CONFIG['mode']}' — skipping dataset/frames.csv loading.")
 
 # %% [markdown]
 # ## 5. Split generation / loading
@@ -538,10 +838,6 @@ def merge_split(df: pd.DataFrame, split_df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-split_df = load_or_create_split(frames_df, DATASET_ROOT, CONFIG)
-frames_df = merge_split(frames_df, split_df)
-
-
 def report_split_balance(df: pd.DataFrame) -> None:
     print("\nSplit balance across available metadata:")
     for col in ["lighting_condition", "contains_smoke", "contains_tephra", "contains_base_glow"]:
@@ -551,7 +847,10 @@ def report_split_balance(df: pd.DataFrame) -> None:
             print(tab.to_string())
 
 
-report_split_balance(frames_df)
+if frames_df is not None:
+    split_df = load_or_create_split(frames_df, DATASET_ROOT, CONFIG)
+    frames_df = merge_split(frames_df, split_df)
+    report_split_balance(frames_df)
 
 # %% [markdown]
 # ## 6. Preprocessing: aspect-preserving resize + padding
@@ -1486,6 +1785,175 @@ def infer_all_frames(model, df: pd.DataFrame, input_size: int, threshold: float,
         print(f"FountainLabeller-ready masks: {pred_root / 'for_labeller' / 'masks' / 'all'}")
 
 # %% [markdown]
+# ## 15b. Frame-folder inference helpers
+#
+# `find_frame_images` — scan a folder (optionally recursive) for supported image files.
+# `infer_frame_folder` — run `predict_original` on every frame and write `<stem>_mask.png`
+# outputs directly to `output_dir`, with optional overlays / probability maps.
+# No `frames.csv` is required.
+
+# %%
+def find_frame_images(
+    frame_folder: str,
+    extensions: List[str],
+    recursive: bool = False,
+) -> List[Path]:
+    """Return a naturally-sorted list of image files, skipping *_mask files."""
+    import re as _re
+
+    def _natural_key(p: Path) -> list:
+        return [int(c) if c.isdigit() else c.lower()
+                for c in _re.split(r"(\d+)", p.name)]
+
+    root = Path(frame_folder)
+    exts = tuple(e.lower() for e in extensions)
+    pattern_iter = root.rglob("*") if recursive else root.iterdir()
+    paths = [
+        p for p in pattern_iter
+        if p.is_file()
+        and p.suffix.lower() in exts
+        and not p.name.startswith(".")
+        and not p.stem.endswith("_mask")
+    ]
+    paths.sort(key=_natural_key)
+    if not paths:
+        raise FileNotFoundError(
+            f"No supported images found in {frame_folder}. "
+            f"Supported extensions: {', '.join(sorted(exts))}"
+        )
+    print(f"Found {len(paths)} frame images in {frame_folder}")
+    print("  First frames:", [p.name for p in paths[:4]])
+    return paths
+
+
+@torch.no_grad()
+def infer_frame_folder(
+    model: nn.Module,
+    frame_paths: List[Path],
+    output_dir: str,
+    input_size: int,
+    threshold: float,
+    device: "torch.device",
+    config: Dict,
+) -> None:
+    """
+    Run inference on frame_paths and write FountainLabeller-compatible masks.
+
+    Output naming (fixed):  <input_stem>_mask.png
+    """
+    out_root = Path(output_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    write_overlays = config.get("write_frame_folder_overlays", False)
+    write_probs    = config.get("write_frame_folder_probabilities", False)
+
+    overlays_dir = out_root / "overlays"
+    probs_dir    = out_root / "probabilities"
+    if write_overlays:
+        overlays_dir.mkdir(parents=True, exist_ok=True)
+    if write_probs:
+        probs_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    records = []
+    n_total = len(frame_paths)
+
+    for i, image_path in enumerate(frame_paths, start=1):
+        stem      = image_path.stem
+        mask_path = out_root / f"{stem}_mask.png"
+
+        try:
+            prob_orig, mask_orig = predict_original(
+                model=model,
+                image_path=image_path,
+                input_size=input_size,
+                threshold=threshold,
+                device=device,
+            )
+        except Exception as exc:
+            print(f"  [WARN] Failed {image_path.name}: {exc}")
+            records.append({
+                "input_frame": str(image_path),
+                "output_mask": "",
+                "probability_path": "",
+                "overlay_path": "",
+                "width": "", "height": "",
+                "positive_pixels": "",
+                "positive_fraction": "",
+                "threshold": threshold,
+                "status": "failed",
+                "error_message": str(exc),
+            })
+            continue
+
+        cv2.imwrite(str(mask_path), mask_orig)
+        h, w = mask_orig.shape[:2]
+        positive_pixels = int((mask_orig > 0).sum())
+
+        prob_path_str    = ""
+        overlay_path_str = ""
+
+        if write_probs:
+            prob_path = probs_dir / f"{stem}_prob.png"
+            cv2.imwrite(str(prob_path), (prob_orig * 255).astype(np.uint8))
+            prob_path_str = str(prob_path)
+
+        if write_overlays:
+            overlay_path = overlays_dir / f"{stem}_overlay.png"
+            img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if img_bgr is not None:
+                pred_bin = mask_orig > 0
+                overlay  = img_bgr.copy()
+                overlay[pred_bin] = (
+                    0.5 * overlay[pred_bin] + 0.5 * np.array([0, 0, 255])
+                ).astype(np.uint8)
+                cv2.imwrite(str(overlay_path), overlay)
+                overlay_path_str = str(overlay_path)
+
+        records.append({
+            "input_frame":       str(image_path),
+            "output_mask":       str(mask_path),
+            "probability_path":  prob_path_str,
+            "overlay_path":      overlay_path_str,
+            "width":             w,
+            "height":            h,
+            "positive_pixels":   positive_pixels,
+            "positive_fraction": positive_pixels / float(max(1, w * h)),
+            "threshold":         threshold,
+            "status":            "ok",
+            "error_message":     "",
+        })
+
+        if i % 10 == 0 or i == n_total:
+            print(f"  {i}/{n_total} frames predicted")
+
+    # --- run summaries ---
+    summary_csv  = out_root / "prediction_run_summary.csv"
+    summary_json = out_root / "prediction_run_config.json"
+
+    pd.DataFrame(records).to_csv(summary_csv, index=False)
+
+    with open(summary_json, "w") as _f:
+        json.dump({
+            "checkpoint_path": CONFIG.get("checkpoint_path"),
+            "frame_folder":    CONFIG.get("frame_folder"),
+            "output_dir":      str(out_root),
+            "num_frames":      n_total,
+            "threshold":       threshold,
+            "input_size":      input_size,
+            "mask_naming":     "{input_stem}_mask.png",
+            "created_at":      datetime.now().isoformat(),
+        }, _f, indent=2)
+
+    n_ok   = sum(1 for r in records if r.get("status") == "ok")
+    n_fail = n_total - n_ok
+    print(f"\nDone. {n_ok} succeeded, {n_fail} failed.")
+    print("FountainLabeller-compatible masks are ready:")
+    print(f"  {out_root}")
+    print("Copy this folder's contents into the matching FountainLabeller masks folder.")
+    print("Mask naming convention used: {input_stem}_mask.png")
+
+# %% [markdown]
 # ## 16. Run folder + orchestration
 #
 # Creates a timestamped run folder, copies the split and class definition, then dispatches on
@@ -1603,8 +2071,39 @@ def main(config: Dict, df: pd.DataFrame, dataset_root: Path):
         print(f"\nDONE. Everything saved under: {run_dir}")
         return model, run_dir, threshold
 
+    elif mode == "infer_frame_folder":
+        require_frame_folder_paths()
+        model, info = load_model_from_checkpoint(config["checkpoint_path"], DEVICE)
+        input_size = info["input_size"]
+        threshold  = info["threshold"]
+
+        if config.get("threshold_override") is not None:
+            threshold = float(config["threshold_override"])
+            print(f"Using threshold_override: {threshold}")
+        else:
+            print(f"Using checkpoint threshold: {threshold}")
+
+        frame_paths = find_frame_images(
+            config["frame_folder"],
+            config["frame_folder_extensions"],
+            recursive=config.get("frame_folder_recursive", False),
+        )
+        infer_frame_folder(
+            model=model,
+            frame_paths=frame_paths,
+            output_dir=config["frame_folder_output_dir"],
+            input_size=input_size,
+            threshold=threshold,
+            device=DEVICE,
+            config=config,
+        )
+        return model, Path(config["frame_folder_output_dir"]), threshold
+
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use train | resume_train | infer_all | evaluate.")
+        raise ValueError(
+            f"Unknown mode: {mode}. "
+            "Use train | resume_train | infer_all | evaluate | infer_frame_folder."
+        )
 
 # %% [markdown]
 # ## Run
@@ -1616,7 +2115,13 @@ def main(config: Dict, df: pd.DataFrame, dataset_root: Path):
 if __name__ == "__main__":
     model, run_dir, used_threshold = main(CONFIG, frames_df, DATASET_ROOT)
     print(f"\nActive threshold: {used_threshold}")
-    print("Bring predicted masks back into FountainLabeller from:")
-    print(f"  {run_dir / 'predictions_all_frames' / 'masks'}")
-    if CONFIG["export_for_labeller"]:
-        print(f"  {run_dir / 'predictions_all_frames' / 'for_labeller' / 'masks' / 'all'}")
+    if CONFIG["mode"] == "infer_frame_folder":
+        print("\nFountainLabeller-compatible masks are ready:")
+        print(f"  {run_dir}")
+        print("Copy this folder's contents into the matching FountainLabeller masks folder.")
+        print("Mask naming convention used: {input_stem}_mask.png")
+    else:
+        print("Bring predicted masks back into FountainLabeller from:")
+        print(f"  {run_dir / 'predictions_all_frames' / 'masks'}")
+        if CONFIG["export_for_labeller"]:
+            print(f"  {run_dir / 'predictions_all_frames' / 'for_labeller' / 'masks' / 'all'}")
